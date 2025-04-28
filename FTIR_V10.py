@@ -5,6 +5,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 import spectrochempy as scp
 import pandas as pd
 import polars as pl
+import numpy as np
 from natsort import natsorted
 
 # ----------------------- Global Variable Initialization -----------------------
@@ -135,29 +136,54 @@ def convert_spa_folder():
 
 def convert_srs_file():
     """
-    Converts a single .srs file (a multi-spectrum time-series) into separate CSV files.
-    Each 1D spectrum from the 2D dataset is saved as an individual CSV file.
+    Converts a .srs file into one combined CSV file with spectra as separate columns.
+    Corrects absorbance inversion by reversing the dataset data.
+    Displays a progress bar during processing.
     """
-    file_path = filedialog.askopenfilename(title="Select an SRS File", filetypes=[("SRS files", "*.srs")])
+    file_path = filedialog.askopenfilename(
+        title="Select an SRS File", filetypes=[("SRS files", "*.srs")]
+    )
     if not file_path:
         return
     try:
         dataset = scp.read_omnic(file_path)
-        if dataset is None:
-            raise ValueError("SpectroChemPy returned None. The file might not be a supported SRS format.")
+        if dataset is None or dataset.ndim != 2:
+            raise ValueError("Expected a 2D dataset from SRS file.")
+
+        # Correct absorbance: reverse along the second axis
+        dataset.data = dataset.data[:, ::-1]
+
+        x = dataset.x.data            # Wavenumber axis (after correction)
         base, _ = os.path.splitext(file_path)
-        if dataset.ndim == 2:
-            for i, subds in enumerate(dataset):
-                out_csv = f"{base}_{i + 1}.csv"
-                subds.write_csv(out_csv)
-            messagebox.showinfo("Conversion Successful",
-                                f"Converted {dataset.shape[0]} spectra.\nFiles saved as {base}_X.csv")
-        else:
-            out_csv = base + ".csv"
-            dataset.write_csv(out_csv)
-            messagebox.showinfo("Conversion Successful", f"File saved as {out_csv}")
-    except Exception as e:
-        messagebox.showerror("Conversion Error", f"Error converting SRS file:\n{e}")
+        output_csv = f"{base}_combined.csv"
+
+        # Setup progress bar window
+        progress_win = tk.Toplevel()
+        progress_win.title("Exporting Spectra...")
+        tk.Label(progress_win, text="Exporting spectra to combined CSV...").pack(pady=10)
+        progress = ttk.Progressbar(progress_win, orient="horizontal", length=300, mode="determinate")
+        progress.pack(pady=10)
+        progress["maximum"] = dataset.shape[0]
+        progress["value"] = 0
+        progress_win.update()
+
+        # Stack all spectra correctly
+        y_data = []  # Collect y data separately
+        for i in range(dataset.shape[0]):
+            subds = dataset[i].squeeze()  # Make sure we squeeze dimensions properly
+            y = subds.data                # Now y is shape (n_points,)
+            y_data.append(y)
+            progress["value"] += 1
+            progress_win.update()
+
+        # Now combine x and all y spectra
+        combined_array = np.column_stack([x] + y_data)
+        headers = ["Wavenumber"] + [f"Spectrum {i+1}" for i in range(dataset.shape[0])]
+        np.savetxt(output_csv, combined_array, delimiter=",", header=",".join(headers), comments='')
+
+        progress_win.destroy()
+        messagebox.showinfo("Conversion Successful", f"{dataset.shape[0]} spectra saved to:\n{output_csv}")
+
 
 
 # ----------------------- Step 2 Functions: CSV Combination -----------------------
