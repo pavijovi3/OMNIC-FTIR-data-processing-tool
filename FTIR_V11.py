@@ -1,0 +1,1068 @@
+import csv
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+import pandas as pd
+import polars as pl
+import spectrochempy as scp
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from natsort import natsorted
+
+# ----------------------- Global Variable Initialization -----------------------
+global_file_path_lv = ""
+global_file_path_cv = ""
+input_file_label_cv = None
+file_label_lv = None
+filename_step4 = ""
+df_step4 = None
+
+# GUI Buttons (initialized later)
+combine_csv_button = None
+sort_button = None
+time_resolved_csv_button = None
+rename_columns_cv_button = None
+rename_columns_lv_button = None
+rename_time_button = None
+process_background_data_button = None
+
+# These variables will be set in the settings panels
+global_t_eq_cv = None
+global_e_begin_cv = None
+global_e_vertex1_cv = None
+global_e_vertex2_cv = None
+global_scan_rate_cv = None
+global_num_scans_cv = None
+
+global_t_eq_lv = None
+global_e_begin_lv = None
+global_e_end_lv = None
+global_scan_rate_lv = None
+
+
+# ----------------------- Helper Function for CV Voltage Calculation -----------------------
+def calculate_cv_voltage(t, params):
+    E_begin = params['E_begin']
+    E_vertex1 = params['E_vertex1']
+    E_vertex2 = params['E_vertex2']
+    sr = params['scan_rate']
+    T_eq = params['T_eq']
+
+    if t < T_eq:
+        return E_begin
+
+    if E_begin == E_vertex2:
+        t1 = abs(E_vertex1 - E_begin) / sr
+        T_cycle = 2 * t1
+        t_in_cycle = (t - T_eq) % T_cycle
+        if t_in_cycle < t1:
+            return E_begin + (E_vertex1 - E_begin) * (t_in_cycle / t1)
+        else:
+            return E_vertex1 + (E_begin - E_vertex1) * ((t_in_cycle - t1) / t1)
+    else:
+        t1 = abs(E_vertex1 - E_begin) / sr
+        t2 = abs(E_vertex2 - E_vertex1) / sr
+        t3 = abs(E_vertex1 - E_begin) / sr
+        T_cycle = t1 + t2 + t3
+        t_in_cycle = (t - T_eq) % T_cycle
+        if t_in_cycle < t1:
+            return E_begin + (E_vertex1 - E_begin) * (t_in_cycle / t1)
+        elif t_in_cycle < t1 + t2:
+            return E_vertex1 + (E_vertex2 - E_vertex1) * ((t_in_cycle - t1) / t2)
+        else:
+            return E_vertex2 + (E_begin - E_vertex2) * ((t_in_cycle - t1 - t2) / t3)
+
+
+# ----------------------- Helper function to check header in a CSV file -----------------------
+def file_has_header(file_path, header_keywords=["wavenumbers", "cm^-1", "absorbance", "a.u."]):
+    try:
+        with open(file_path, "r") as f:
+            first_line = f.readline().lower()
+        return any(keyword in first_line for keyword in header_keywords)
+    except Exception:
+        return False
+
+
+# ----------------------- STEP 1: Convert OMNIC Files -----------------------
+def convert_spa_folder_individual():
+    folder = filedialog.askdirectory(title="Select Folder Containing SPA Files")
+    if not folder:
+        return
+    spa_files = [f for f in os.listdir(folder) if f.lower().endswith('.spa')]
+    if not spa_files:
+        messagebox.showerror("Error", "No .spa files found.", parent=window)
+        return
+
+    pwin = tk.Toplevel(window);
+    pwin.title("Converting SPA → CSV")
+    ttk.Label(pwin, text="Converting each SPA to its own CSV…").pack(pady=(10, 0))
+    pb = ttk.Progressbar(pwin, orient="horizontal", length=400, mode="determinate")
+    pb["maximum"] = len(spa_files);
+    pb.pack(padx=20, pady=10);
+    pwin.update()
+
+    def _task(path):
+        ds = scp.read_omnic(path)
+        if ds is None: raise ValueError("Unsupported .spa file")
+        out_csv = os.path.splitext(path)[0] + ".csv"
+        spec = ds if ds.ndim == 1 else ds[0]
+        spec.write_csv(out_csv)
+
+    errors = []
+    with ThreadPoolExecutor() as pool:
+        futures = {pool.submit(_task, os.path.join(folder, fn)): fn for fn in spa_files}
+        done = 0
+        for fut in as_completed(futures):
+            fn = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                errors.append(f"{fn}: {e}")
+            done += 1;
+            pb["value"] = done;
+            pwin.update_idletasks()
+
+    pwin.destroy()
+    if errors:
+        messagebox.showerror("Errors", "\n".join(errors), parent=window)
+    else:
+        messagebox.showinfo("Done", "All SPA files converted.", parent=window)
+
+
+def convert_srs_file_combined():
+    file_path = filedialog.askopenfilename(
+        title="Select an SRS File",
+        filetypes=[("SRS files", "*.srs")],
+        parent=window
+    )
+    if not file_path: return
+
+    try:
+        ds = scp.read_omnic(file_path)
+        if ds is None or ds.ndim != 2:
+            raise ValueError("Expected a 2D dataset from SRS.")
+        ds.data = ds.data[:, ::-1]
+        x = ds.x.data
+        n_spec, n_pts = ds.data.shape
+        base, _ = os.path.splitext(file_path)
+        out_csv = f"{base}_combined.csv"
+
+        pwin = tk.Toplevel(window);
+        pwin.title("Exporting SRS → CSV")
+        ttk.Label(pwin, text="Writing rows to CSV…").pack(pady=(10, 0))
+        pb = ttk.Progressbar(pwin, orient="horizontal", length=400, mode="determinate")
+        pb["maximum"] = n_pts;
+        pb.pack(padx=20, pady=10);
+        pwin.update()
+
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Wavenumber"] + [f"Spectrum {i + 1}" for i in range(n_spec)])
+            for i in range(n_pts):
+                writer.writerow([x[i]] + ds.data[:, i].tolist())
+                pb["value"] = i + 1;
+                pwin.update_idletasks()
+
+        pwin.destroy()
+        messagebox.showinfo("Success",
+                            f"{n_spec} spectra × {n_pts} points written to:\n{out_csv}",
+                            parent=window
+                            )
+    except Exception as e:
+        messagebox.showerror("Error", str(e), parent=window)
+
+
+# ----------------------- Step 2 Functions: CSV Combination -----------------------
+def combine_csv_files_lazy(folder_path: str) -> pl.LazyFrame:
+    csv_files = natsorted([f for f in os.listdir(folder_path) if f.lower().endswith('.csv')])
+    if not csv_files:
+        raise FileNotFoundError("No CSV files found in the selected folder.")
+    combined = None
+    for fn in csv_files:
+        path = os.path.join(folder_path, fn)
+        skip = 1 if file_has_header(path) else 0
+        lf = (pl.scan_csv(path, has_header=False, skip_rows=skip, new_columns=["Wavenumber", fn])
+              .with_columns((pl.col("Wavenumber") // 0.1 * 0.1).alias("Wavenumber")))
+        combined = lf if combined is None else combined.join(lf, how="full", on="Wavenumber")
+    return combined
+
+
+def combine_series_csv_to_csv():
+    folder = filedialog.askdirectory(title="Select Folder with CSV Files")
+    if not folder: return
+
+    status_label.config(text="Processing Series CSV...", fg="blue")
+    combine_csv_button.config(state=tk.DISABLED)
+    window.update_idletasks()
+
+    try:
+        combined_lazy = combine_csv_files_lazy(folder)
+        out_default = os.path.join(folder, "combined_series.csv")
+        save_path = filedialog.asksaveasfilename(
+            initialfile=out_default, defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")], title="Save combined CSV", parent=window
+        )
+        if save_path:
+            combined_lazy.sink_csv(save_path)
+            messagebox.showinfo("Success", f"Data saved as {save_path}.", parent=window)
+    except Exception as e:
+        messagebox.showerror("Error", str(e), parent=window)
+    finally:
+        status_label.config(text="Completed", fg="green")
+        combine_csv_button.config(state=tk.NORMAL)
+
+
+def sort_spectral_columns():
+    file_path = filedialog.askopenfilename(
+        title="Select Combined CSV File to Sort",
+        filetypes=[("CSV files", "*.csv")]
+    )
+    if not file_path: return
+
+    status_label.config(text="Sorting Spectral Columns...", fg="blue")
+    window.update_idletasks()
+    sort_button.config(state=tk.DISABLED)
+    if file_has_header(file_path):
+        df = pd.read_csv(file_path, header=None, skiprows=1)
+    else:
+        df = pd.read_csv(file_path, header=None)
+    wavenumber_col = df.pop(0)
+    sorted_df = df.reindex(sorted(df.columns), axis=1)
+    sorted_df.insert(0, "Wavenumber", wavenumber_col)
+    sorted_file_path = os.path.splitext(file_path)[0] + "_sorted.csv"
+    sorted_df.to_csv(sorted_file_path, index=False, header=False)
+    messagebox.showinfo("Success", f"Sorted data saved as {sorted_file_path}.", parent=window)
+    status_label.config(text="Completed", fg="green")
+    sort_button.config(state=tk.NORMAL)
+
+
+# ----------------------- Step 2b: Combine Time-Resolved CSV -----------------------
+def extract_time_value(filename):
+    match = re.search(r't\s*=\s*([\d.]+)', filename)
+    return float(match.group(1)) if match else None
+
+
+def combine_time_resolved_csv_to_csv():
+    global time_resolved_csv_button
+    folder_path = filedialog.askdirectory(title="Select Folder with Time-Resolved CSV Files")
+    if not folder_path: return
+
+    status_label.config(text="Processing Time-Resolved CSV...", fg="blue")
+    time_resolved_csv_button.config(state=tk.DISABLED)
+    window.update_idletasks()
+
+    csv_files = [f for f in os.listdir(folder_path)
+                 if f.lower().endswith('.csv') and "static" not in f.lower()]
+    if not csv_files:
+        messagebox.showerror("Error", "No suitable CSV files found.", parent=window)
+        return
+
+    combined_df = None
+    for file in csv_files:
+        file_path = os.path.join(folder_path, file)
+        time_val = extract_time_value(file)
+        if time_val is None:
+            messagebox.showwarning("Skipping File", f"Could not extract time from: {file}", parent=window)
+            continue
+        skiprows = 1 if file_has_header(file_path) else 0
+        df = pd.read_csv(file_path, header=None, skiprows=skiprows)
+        if df.shape[1] < 2:
+            continue
+        df.columns = ['Wavenumber', f"{time_val:.2f}"]
+        df['Wavenumber'] = (df['Wavenumber'] // 0.1) * 0.1
+        combined_df = df if combined_df is None else pd.merge(combined_df, df, on='Wavenumber', how='outer')
+
+    if combined_df is None:
+        messagebox.showerror("Error", "No valid data to combine.", parent=window)
+    else:
+        time_cols = sorted([c for c in combined_df.columns if c != 'Wavenumber'],
+                           key=lambda x: float(x))
+        combined_df = combined_df[['Wavenumber'] + time_cols]
+        save_as_csv_pandas(combined_df, folder_path)
+
+    status_label.config(text="Completed", fg="green")
+    time_resolved_csv_button.config(state=tk.NORMAL)
+
+
+def save_as_csv_pandas(combined_data, folder_path, default_name_base="combined"):
+    default_file = os.path.join(folder_path, f"{default_name_base}.csv")
+    save_path = filedialog.asksaveasfilename(
+        initialfile=default_file, defaultextension=".csv",
+        filetypes=[("CSV files", "*.csv")], title="Save data"
+    )
+    if save_path:
+        combined_data.to_csv(save_path, index=False)
+        messagebox.showinfo("Success", f"Data saved as {save_path}.", parent=window)
+
+
+# ----------------------- Step 3 Functions: Rename Columns -----------------------
+def get_cv_settings():
+    global t_eq_entry_cv, e_begin_entry_cv, e_vertex1_entry_cv, e_vertex2_entry_cv, scan_rate_entry_cv, num_scans_entry_cv, global_file_path_cv, input_file_label_cv
+
+    def select_input_file():
+        global global_file_path_cv
+        selected = filedialog.askopenfilename(
+            title="Select CV Input File", filetypes=[("CSV files", "*.csv")]
+        )
+        if selected:
+            global_file_path_cv = selected
+            input_file_label_cv.config(text=os.path.basename(selected))
+            _update_cv_potential_change()
+
+    def _update_cv_potential_change():
+        try:
+            t_eq = float(t_eq_entry_cv.get())
+            eb = float(e_begin_entry_cv.get())
+            v1 = float(e_vertex1_entry_cv.get())
+            v2 = float(e_vertex2_entry_cv.get())
+            sr = float(scan_rate_entry_cv.get())
+            ns = int(num_scans_entry_cv.get())
+            if not global_file_path_cv:
+                return
+            if not (min(v1, v2) <= eb <= max(v1, v2)):
+                return
+            df = pd.read_csv(global_file_path_cv)
+            n_spec = len(df.columns) - 1
+            if eb == v2:
+                cycle_range = 2 * abs(v1 - eb)
+            else:
+                cycle_range = abs(v1 - eb) + abs(v2 - v1) + abs(eb - v2)
+            total_time = t_eq + ns * (cycle_range / sr)
+            delta_t = total_time / n_spec
+            change = sr * delta_t
+            potential_change_label_cv.config(text=f"Potential Change per Spectrum: {change:.6f} V/sec")
+            globals().update({
+                'global_t_eq_cv': t_eq,
+                'global_e_begin_cv': eb,
+                'global_e_vertex1_cv': v1,
+                'global_e_vertex2_cv': v2,
+                'global_scan_rate_cv': sr,
+                'global_num_scans_cv': ns
+            })
+        except:
+            pass
+
+    # Header
+    tk.Label(settings_frame_cv,
+             text="Enter CV Settings", fg="blue", font=("Helvetica", 10, "bold")
+             ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+    # External trigger note immediately under header
+    tk.Label(settings_frame_cv,
+             text="If using external trigger, T_eq = 0.",
+             fg="purple", font=("Helvetica", 10, "bold")
+             ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 5))
+
+    # Field labels and entries shifted down by 1 row
+    labels = ["T equilibrium (s):", "E begin (V):", "E Vertex1 (V):", "E Vertex2 (V):",
+              "Scan rate (V/s):", "Number of scans:"]
+    for idx, text in enumerate(labels, start=2):
+        tk.Label(settings_frame_cv, text=text, font=("Helvetica", 10, "bold")
+                 ).grid(row=idx, column=0, sticky="w", pady=2)
+
+    t_eq_entry_cv = tk.Entry(settings_frame_cv)
+    e_begin_entry_cv = tk.Entry(settings_frame_cv)
+    e_vertex1_entry_cv = tk.Entry(settings_frame_cv)
+    e_vertex2_entry_cv = tk.Entry(settings_frame_cv)
+    scan_rate_entry_cv = tk.Entry(settings_frame_cv)
+    num_scans_entry_cv = tk.Entry(settings_frame_cv)
+    entries = [t_eq_entry_cv, e_begin_entry_cv, e_vertex1_entry_cv,
+               e_vertex2_entry_cv, scan_rate_entry_cv, num_scans_entry_cv]
+    for idx, entry in enumerate(entries, start=2):
+        entry.grid(row=idx, column=1, pady=2)
+        entry.bind('<FocusOut>', lambda e: _update_cv_potential_change())
+
+    # File selector stays at row 8
+    tk.Button(settings_frame_cv,
+              text="Select CV Input File",
+              command=select_input_file,
+              bg="lightgray"
+              ).grid(row=8, column=0, columnspan=2, pady=4)
+    input_file_label_cv = tk.Label(settings_frame_cv,
+                                   text="No file selected", fg="black")
+    input_file_label_cv.grid(row=9, column=0, columnspan=2, pady=2)
+
+
+def rename_columns_cv():
+    global global_file_path_cv
+    if not global_file_path_cv:
+        messagebox.showerror("Error", "No CV file selected", parent=window)
+        return
+
+    status_label.config(text="Renaming CV Headers...", fg="blue")
+    rename_columns_cv_button.config(state=tk.DISABLED)
+    window.update_idletasks()
+
+    try:
+        df = pd.read_csv(global_file_path_cv)
+        n_spec = len(df.columns) - 1
+        params = {
+            "E_begin": global_e_begin_cv,
+            "E_vertex1": global_e_vertex1_cv,
+            "E_vertex2": global_e_vertex2_cv,
+            "scan_rate": global_scan_rate_cv,
+            "T_eq": global_t_eq_cv
+        }
+        if global_e_begin_cv == global_e_vertex2_cv:
+            t1 = abs(global_e_vertex1_cv - global_e_begin_cv) / global_scan_rate_cv
+            cycle = 2 * t1
+        else:
+            t1 = abs(global_e_vertex1_cv - global_e_begin_cv) / global_scan_rate_cv
+            t2 = abs(global_e_vertex2_cv - global_e_vertex1_cv) / global_scan_rate_cv
+            t3 = t1
+            cycle = t1 + t2 + t3
+
+        total = global_t_eq_cv + global_num_scans_cv * cycle
+        delta = total / n_spec
+
+        new_cols = ["Wavenumber"]
+        for i in range(n_spec):
+            t = i * delta
+            v = (global_e_begin_cv if t < global_t_eq_cv
+                 else calculate_cv_voltage(t, params))
+            new_cols.append(f"{v:.4f} V")
+
+        df.columns = new_cols
+        out = os.path.splitext(global_file_path_cv)[0] + "_full_renamed_cv.csv"
+        df.to_csv(out, index=False)
+        messagebox.showinfo("Success", f"Saved: {out}", parent=window)
+        status_label.config(text="Completed", fg="green")
+    except Exception as e:
+        messagebox.showerror("Error", str(e), parent=window)
+        status_label.config(text="Error", fg="red")
+    finally:
+        rename_columns_cv_button.config(state=tk.NORMAL)
+
+
+def get_lv_settings():
+    global t_eq_entry_lv, e_begin_entry_lv, e_end_entry_lv, scan_rate_entry_lv, global_file_path_lv, file_label_lv
+
+    def select_input_file_lv():
+        global global_file_path_lv
+        selected = filedialog.askopenfilename(
+            title="Select LV Input File", filetypes=[("CSV files", "*.csv")]
+        )
+        if selected:
+            global_file_path_lv = selected
+            file_label_lv.config(text=os.path.basename(selected))
+            _update_lv_potential_change()
+
+    def _update_lv_potential_change():
+        try:
+            t_eq = float(t_eq_entry_lv.get())
+            eb = float(e_begin_entry_lv.get())
+            ee = float(e_end_entry_lv.get())
+            sr = float(scan_rate_entry_lv.get())
+            if not global_file_path_lv or eb == ee:
+                return
+            df = pd.read_csv(global_file_path_lv)
+            n_spec = len(df.columns) - 1
+            ramp_time = abs(ee - eb) / sr
+            total_time = t_eq + ramp_time
+            delta_t = total_time / n_spec
+            change = sr * delta_t
+            potential_change_label_lv.config(text=f"Potential Change per Spectrum: {change:.6f} V/sec")
+            globals().update({
+                'global_t_eq_lv': t_eq,
+                'global_e_begin_lv': eb,
+                'global_e_end_lv': ee,
+                'global_scan_rate_lv': sr
+            })
+        except:
+            pass
+
+    # Header
+    tk.Label(settings_frame_lv,
+             text="Enter LV Settings", fg="blue", font=("Helvetica", 10, "bold")
+             ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+    # External trigger note at row 1
+    tk.Label(settings_frame_lv,
+             text="If using external trigger, T_eq = 0.",
+             fg="purple", font=("Helvetica", 10, "bold")
+             ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 5))
+
+    # Field labels and entries start at row 2
+    labels = ["T equilibrium (s):", "E begin (V):", "E end (V):", "Scan rate (V/s):"]
+    for idx, text in enumerate(labels, start=2):
+        tk.Label(settings_frame_lv, text=text, font=("Helvetica", 10, "bold")
+                 ).grid(row=idx, column=0, sticky="w", pady=2)
+
+    t_eq_entry_lv = tk.Entry(settings_frame_lv)
+    e_begin_entry_lv = tk.Entry(settings_frame_lv)
+    e_end_entry_lv = tk.Entry(settings_frame_lv)
+    scan_rate_entry_lv = tk.Entry(settings_frame_lv)
+    entries = [t_eq_entry_lv, e_begin_entry_lv, e_end_entry_lv, scan_rate_entry_lv]
+    for idx, entry in enumerate(entries, start=2):
+        entry.grid(row=idx, column=1, pady=2)
+        entry.bind('<FocusOut>', lambda e: _update_lv_potential_change())
+
+    # File selector at row 6
+    tk.Button(settings_frame_lv,
+              text="Select LV Input File",
+              command=select_input_file_lv,
+              bg="lightgray"
+              ).grid(row=6, column=0, columnspan=2, pady=4)
+    file_label_lv = tk.Label(settings_frame_lv, text="No file selected", fg="black")
+    file_label_lv.grid(row=7, column=0, columnspan=2, pady=2)
+
+
+def rename_columns_lv():
+    global global_file_path_lv
+    if not global_file_path_lv:
+        messagebox.showerror("Error", "No LV file selected", parent=window)
+        return
+
+    status_label.config(text="Renaming LV Headers...", fg="blue")
+    rename_columns_lv_button.config(state=tk.DISABLED)
+    window.update_idletasks()
+
+    try:
+        df = pd.read_csv(global_file_path_lv)
+        n_spec = len(df.columns) - 1
+        ramp = abs(global_e_end_lv - global_e_begin_lv) / global_scan_rate_lv
+        total = global_t_eq_lv + ramp
+        delta = total / n_spec
+
+        new_cols = ["Wavenumber"]
+        for i in range(n_spec):
+            t = i * delta
+            if t < global_t_eq_lv:
+                v = global_e_begin_lv
+            else:
+                tr = t - global_t_eq_lv
+                if global_e_end_lv > global_e_begin_lv:
+                    v = min(global_e_end_lv, global_e_begin_lv + global_scan_rate_lv * tr)
+                else:
+                    v = max(global_e_end_lv, global_e_begin_lv - global_scan_rate_lv * tr)
+            new_cols.append(f"{v:.4f} V")
+
+        df.columns = new_cols
+        out = os.path.splitext(global_file_path_lv)[0] + "_renamed_lv.csv"
+        df.to_csv(out, index=False)
+        messagebox.showinfo("Success", f"Saved: {out}", parent=window)
+        status_label.config(text="Completed", fg="green")
+    except Exception as e:
+        messagebox.showerror("Error", str(e), parent=window)
+        status_label.config(text="Error", fg="red")
+    finally:
+        rename_columns_lv_button.config(state=tk.NORMAL)
+
+
+def rename_headers_based_on_time():
+    global filename_step4
+    fn = filedialog.askopenfilename(
+        title="Select CSV for Time Rename", filetypes=[("CSV files", "*.csv")]
+    )
+    if not fn:
+        return
+    status_label.config(text="Renaming Time-based Headers...", fg="blue")
+    rename_time_button.config(state=tk.DISABLED)
+    window.update_idletasks()
+    try:
+        df = pd.read_csv(fn)
+        total = simpledialog.askfloat("Input", "Total Time Collected (seconds):")
+        if total is None:
+            return
+        ncols = len(df.columns) - 1
+        dt = total / ncols
+        df.columns = ["Wavenumber"] + [f"{i * dt:.3f}s" for i in range(ncols)]
+        out = os.path.splitext(fn)[0] + "_renamed_Time.csv"
+        df.to_csv(out, index=False)
+        messagebox.showinfo("Success", f"Saved: {out}", parent=window)
+        status_label.config(text="Completed", fg="green")
+    except:
+        messagebox.showerror("Error", "Enter valid number", parent=window)
+        status_label.config(text="Error", fg="red")
+    finally:
+        rename_time_button.config(state=tk.NORMAL)
+
+
+# ----------------------- Step 4: Background Reprocessing -----------------------
+def bg_processing():
+    file_path = filedialog.askopenfilename(
+        title="Select Input File",
+        filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx")]
+    )
+    if not file_path: return
+
+    status_label.config(text="Reprocessing Background...", fg="blue")
+    process_background_data_button.config(state=tk.DISABLED)
+    window.update_idletasks()
+
+    try:
+        ext = os.path.splitext(file_path)[1].lower()
+        df = pd.read_excel(file_path) if ext == '.xlsx' else pd.read_csv(file_path)
+    except Exception as e:
+        messagebox.showerror("Error", f"Unsupported format: {e}", parent=window)
+        status_label.config(text="Idle", fg="green")
+        process_background_data_button.config(state=tk.NORMAL)
+        return
+
+    # choose column dialog
+    chooser = tk.Toplevel(window);
+    chooser.title("Select Background Column")
+    cols = [c for c in df.columns if c != "Wavenumber"]
+    width = max(30, max(len(str(c)) for c in cols) // 2)
+    ttk.Label(chooser, text="Choose a column:").pack(pady=5)
+    cb = ttk.Combobox(chooser, values=cols, width=width);
+    cb.pack(pady=5)
+
+    def confirm():
+        col = cb.get()
+        if not col:
+            messagebox.showerror("Error", "No column selected", parent=window)
+            return
+        chooser.destroy()
+        out_df = df.copy()
+        for c in df.columns:
+            if c != "Wavenumber":
+                out_df[c] = df[c] - (df[col] if c != col else 0)
+        out = os.path.splitext(file_path)[0] + f"_{col}.csv"
+        out_df.to_csv(out, index=False)
+        messagebox.showinfo("Success", f"Saved: {out}", parent=window)
+        status_label.config(text="Idle", fg="green")
+        process_background_data_button.config(state=tk.NORMAL)
+
+    ttk.Button(chooser, text="Confirm", command=confirm).pack(pady=5)
+
+
+# ----------------------- STEP 5: Skip Spectral Columns (Linear & CV-Aware) -----------------------
+# ——————————— Linear Skip Functionality ———————————
+def linear_skip_run():
+    path = lin_file_path.get()
+    if not path or not os.path.isfile(path):
+        messagebox.showerror("Error", "Select a valid CSV", parent=root)
+        return
+    try:
+        n = int(lin_n_entry.get())
+        if n < 0:
+            raise ValueError
+    except ValueError:
+        messagebox.showerror("Error", "Enter non-negative integer for n", parent=root)
+        return
+
+    df = pd.read_csv(path)
+    cols = df.shape[1]
+    if cols < 3:
+        messagebox.showerror("Error", "CSV needs ≥3 columns", parent=root)
+        return
+
+    keep = [0, 1]
+    cycle = n + 1
+    for i in range(2, cols - 1):
+        if (i - 2) % cycle == n:
+            keep.append(i)
+    keep.append(cols - 1)
+
+    out = df.iloc[:, keep]
+    base = os.path.splitext(path)[0]
+    out_path = f"{base}_skip{n}.csv"
+    out.to_csv(out_path, index=False)
+    messagebox.showinfo("Done", f"Saved: {out_path}", parent=root)
+
+
+def linear_browse():
+    path = filedialog.askopenfilename(title="Select CSV for Linear Skip",
+                                      filetypes=[("CSV", "*.csv")])
+    if path:
+        lin_file_path.set(path)
+
+
+# ————————— CV-Aware Skip Functionality —————————
+def cv_browse_and_suggest():
+    path = filedialog.askopenfilename(title="Select CV-renamed CSV",
+                                      filetypes=[("CSV", "*.csv")])
+    if not path:
+        return
+    cv_file_path.set(path)
+    # parse headers for voltage suggestions
+    with open(path, newline='') as f:
+        hdr = next(csv.reader(f))
+    volts = []
+    for h in hdr[1:]:
+        m = re.search(r"[-+]?\d*\.\d+|\d+", h)
+        if m:
+            volts.append(float(m.group()))
+    if len(volts) < 2:
+        return
+    dV_sugg = (max(volts) - min(volts)) / (len(volts) - 1)
+    dv_entry.delete(0, tk.END);
+    dv_entry.insert(0, f"{dV_sugg:.4f}")
+    sugg_dv_lbl.config(text=f"Suggested: {dV_sugg:.4f} V")
+    pos_entry.delete(0, tk.END);
+    pos_entry.insert(0, f"{dV_sugg:.4f}")
+    sugg_pos_lbl.config(text=f"±{dV_sugg:.4f}")
+    neg_entry.delete(0, tk.END);
+    neg_entry.insert(0, f"{dV_sugg:.4f}")
+    sugg_neg_lbl.config(text=f"±{dV_sugg:.4f}")
+
+
+def cv_skip_run():
+    path = cv_file_path.get()
+    if not path or not os.path.isfile(path):
+        messagebox.showerror("Error", "Select a valid CSV", parent=root)
+        return
+
+    # collect inputs
+    try:
+        Eb = float(e_begin_entry.get())
+        Ev1 = float(e_v1_entry.get())
+        Ev2 = float(e_v2_entry.get())
+        sr = float(sr_entry.get())
+        T_eq = float(teq_entry.get())
+        nsc = int(nsc_entry.get())
+        dV = float(dv_entry.get())
+        tol_p = float(pos_entry.get())
+        tol_n = float(neg_entry.get())
+    except ValueError:
+        messagebox.showerror("Error", "Enter valid numeric CV & ΔV/tolerance", parent=root)
+        return
+
+    # read headers
+    with open(path, newline='') as f:
+        hdr = next(csv.reader(f))
+    voltages = []
+    for h in hdr[1:]:
+        m = re.search(r"[-+]?\d*\.\d+|\d+", h)
+        if not m:
+            messagebox.showerror("Error", f"Bad header '{h}'", parent=root)
+            return
+        voltages.append(float(m.group()))
+
+    last = len(hdr) - 1
+    keep = {0, 1, last}
+
+    # vertex windows (first & last match)
+    for Ev in (Eb, Ev1, Ev2):
+        cands = [i for i, v in enumerate(voltages, start=1) if Ev - tol_n <= v <= Ev + tol_p]
+        if cands:
+            keep.add(cands[0]);
+            keep.add(cands[-1])
+
+    # uniform ΔV sampling (both passes)
+    vmin, vmax = min(voltages), max(voltages)
+    steps = np.arange(vmin, vmax + dV / 2, dV)
+    for target in steps:
+        cands = [i for i, v in enumerate(voltages, start=1) if target - tol_n <= v <= target + tol_p]
+        if cands:
+            keep.add(cands[0]);
+            keep.add(cands[-1])
+
+    keep_list = sorted(keep)
+
+    # stream write out
+    base, _ = os.path.splitext(path)
+    out_path = f"{base}_dV{dV:.3f}.csv"
+    with open(path, newline='') as fin, open(out_path, 'w', newline='') as fout:
+        rdr = csv.reader(fin);
+        wtr = csv.writer(fout)
+        orig = next(rdr)
+        wtr.writerow([orig[i] for i in keep_list])
+        for row in rdr:
+            wtr.writerow([row[i] for i in keep_list])
+
+    messagebox.showinfo("Done", f"Saved: {out_path}", parent=root)
+
+
+# ----------------------- Main GUI: Notebook Tabbed Layout -----------------------
+root = tk.Tk()
+root.title("FTIR Data Processing_V11")
+root.geometry("720x800")
+window = root
+
+
+def exit_application() -> None:
+    root.quit()
+
+
+# ------------------------------------------------------------------ styling
+style = ttk.Style(root)
+style.theme_use("default")
+style.configure("TNotebook.Tab", padding=[10, 5], font=("Helvetica", 10, "bold"))
+style.map("TNotebook.Tab", background=[("selected", "gray")])
+
+# ------------------------------------------------------------- header / status
+header_frame = tk.Frame(root, padx=20, pady=20)
+header_frame.pack(fill="x")
+
+tk.Label(
+    header_frame, text="FTIR Data Processing_V11",
+    font=("Helvetica", 12, "bold"), fg="blue"
+).pack(pady=(0, 10))
+
+status_label = tk.Label(
+    header_frame, text="Idle",
+    font=("Helvetica", 12, "bold"), fg="green"
+)
+status_label.pack(pady=(0, 10))
+
+# ------------------------------------------------------------- top-level tabs
+main_notebook = ttk.Notebook(root)
+main_notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+# =================================================================== STEP 1 ===
+step1_tab = tk.Frame(main_notebook)
+main_notebook.add(step1_tab, text="Step 1 : Convert SPA/SRS")
+
+tk.Label(step1_tab, text="SPA & SRS to CSV Converter",
+         font=("Helvetica", 14, "bold"), fg="blue").pack(pady=10)
+
+tk.Label(
+    step1_tab,
+    text=("Important — store program & data on local disk or OneDrive; "
+          "network drives will not work."),
+    font=("Helvetica", 10, "bold"), fg="red", bg="light yellow",
+    wraplength=500
+).pack(pady=10)
+
+tk.Button(step1_tab, text="Convert SPA → each CSV",
+          font=("Helvetica", 10), bg="sky blue",
+          command=convert_spa_folder_individual).pack(pady=5)
+
+tk.Button(step1_tab, text="Convert SRS → combined CSV",
+          font=("Helvetica", 10), bg="sky blue",
+          command=convert_srs_file_combined).pack(pady=5)
+
+tk.Label(step1_tab,
+         text="Converted CSV files will be saved alongside the source.",
+         font=("Helvetica", 9, "italic"), fg="blue").pack(pady=10)
+
+# =================================================================== STEP 2 ===
+step2_tab = tk.Frame(main_notebook)
+main_notebook.add(step2_tab, text="Step 2 : Combine CSV Files")
+
+tk.Label(step2_tab, text="Combine CSV files",
+         font=("Helvetica", 12, "bold"), fg="blue").pack(pady=(10, 5))
+
+step2_nb = ttk.Notebook(step2_tab)  # ← use this name consistently
+step2_nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+# ---- 2 A : Series collection
+series_tab = tk.Frame(step2_nb)
+step2_nb.add(series_tab, text="Series Collection CSV")
+
+tk.Label(series_tab, text="Combine Series Collection CSV Files",
+         font=("Helvetica", 10, "bold"), fg="blue").pack(pady=10)
+
+combine_csv_button = tk.Button(series_tab, text="Click to Combine CSV Files",
+                               command=combine_series_csv_to_csv, bg="sky blue")
+combine_csv_button.pack(pady=5)
+
+tk.Label(series_tab,
+         text="Note : Sort if >5k files; headers may not align.",
+         font=("Helvetica", 9, "italic"), fg="blue").pack(pady=5)
+
+sort_button = tk.Button(series_tab, text="Sort Spectral Columns",
+                        command=sort_spectral_columns, bg="sky blue")
+sort_button.pack(pady=5)
+
+# ---- 2 B : Time-resolved (step-scan)
+time_tab = tk.Frame(step2_nb)
+step2_nb.add(time_tab, text="Step-Scan Time-Resolved CSV")
+
+tk.Label(time_tab, text="Combine Step-Scan Time-Resolved CSV Files",
+         font=("Helvetica", 10, "bold"), fg="blue").pack(pady=10)
+
+time_resolved_csv_button = tk.Button(
+    time_tab, text="Click to Combine SSTR CSV Files",
+    command=combine_time_resolved_csv_to_csv, bg="sky blue"
+)
+time_resolved_csv_button.pack(pady=5)
+
+# =================================================================== STEP 3 ===
+step3_tab = tk.Frame(main_notebook)
+main_notebook.add(step3_tab, text="Step 3 : Rename Columns")
+
+tk.Label(step3_tab, text="Rename Column Headers",
+         font=("Helvetica", 12, "bold"), fg="blue").pack(pady=(10, 5))
+
+step3_nb = ttk.Notebook(step3_tab)
+step3_nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+# ------------------- 3 A : CV
+cv_tab = tk.Frame(step3_nb)
+step3_nb.add(cv_tab, text="CV Voltage Range")
+
+settings_frame_cv = tk.Frame(cv_tab, padx=10, pady=10)
+settings_frame_cv.pack(fill="x", anchor="nw")
+
+get_cv_settings()
+
+potential_change_label_cv = tk.Label(
+    cv_tab, bg="white", fg="black",
+    text="Potential Change per Spectrum: 0.000000 V/sec",
+    font=("Helvetica", 10)
+)
+potential_change_label_cv.pack(pady=10)
+
+rename_columns_cv_button = tk.Button(
+    cv_tab, text="Rename CV Column Headers",
+    bg="sky blue", command=rename_columns_cv
+)
+rename_columns_cv_button.pack(pady=5)
+
+# ------------------- 3 B : LV
+lv_tab = tk.Frame(step3_nb)
+step3_nb.add(lv_tab, text="LV Voltage Range")
+
+settings_frame_lv = tk.Frame(lv_tab, padx=10, pady=10)
+settings_frame_lv.pack(fill="x", anchor="nw")
+
+get_lv_settings()
+
+potential_change_label_lv = tk.Label(
+    lv_tab, bg="white", fg="black",
+    text="Potential Change per Spectrum: 0.000000 V/sec",
+    font=("Helvetica", 10)
+)
+potential_change_label_lv.pack(pady=10)
+
+rename_columns_lv_button = tk.Button(
+    lv_tab, text="Rename LV Column Headers",
+    bg="sky blue", command=rename_columns_lv
+)
+rename_columns_lv_button.pack(pady=5)
+
+# ------------------- 3 C : Time-based
+tb_tab = tk.Frame(step3_nb)
+step3_nb.add(tb_tab, text="Time-Based Labeling")
+
+tk.Label(tb_tab,
+         text=("Use this if you know total scan duration to label headers\n"
+               "like 0.000 s, 0.250 s …"),
+         font=("Helvetica", 9, "italic", "bold"),
+         fg="purple").pack(pady=10)
+
+rename_time_button = tk.Button(
+    tb_tab, text="Rename Headers Based on Time Intervals",
+    bg="sky blue", command=rename_headers_based_on_time
+)
+rename_time_button.pack(pady=10)
+
+# =================================================================== STEP 4 ===
+step4_tab = tk.Frame(main_notebook)
+main_notebook.add(step4_tab, text="Step 4 : Reprocess Background")
+
+tk.Label(step4_tab, text="Reprocess Background",
+         font=("Helvetica", 12, "bold"), fg="blue").pack(pady=(10, 5))
+
+tk.Label(step4_tab,
+         text=("Logic : Choose a background column and subtract it from all "
+               "others\n(I_reprocessed = I_original − I_background)"),
+         font=("Helvetica", 10), fg="blue",
+         wraplength=400, justify="center").pack(pady=(0, 10))
+
+process_background_data_button = tk.Button(
+    step4_tab, text="Reprocess Background",
+    bg="sky blue", command=bg_processing
+)
+process_background_data_button.pack(pady=10)
+
+# =================================================================== STEP 5 ===
+step5_tab = tk.Frame(main_notebook)
+main_notebook.add(step5_tab, text="Step 5 : Skip Spectral Columns")
+
+tk.Label(step5_tab, text="Skip Spectral Columns",
+         font=("Helvetica", 12, "bold"), fg="blue").pack(pady=(10, 5))
+
+step5_nb = ttk.Notebook(step5_tab)
+step5_nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+# -------------------------- 5 A : Linear Skip
+lin_tab = tk.Frame(step5_nb)
+step5_nb.add(lin_tab, text="Linear Skip")
+
+lin_file_path = tk.StringVar()
+
+tk.Label(lin_tab, text="CSV File:", font=("Arial", 10, "bold")
+         ).grid(row=0, column=0, sticky="e", padx=5, pady=5)
+tk.Entry(lin_tab, textvariable=lin_file_path, width=50
+         ).grid(row=0, column=1, padx=5)
+tk.Button(lin_tab, text="Browse…", command=linear_browse
+          ).grid(row=0, column=2, padx=5)
+
+tk.Label(lin_tab, text="Skip n:", font=("Arial", 10, "bold")
+         ).grid(row=1, column=0, sticky="e", padx=5, pady=5)
+lin_n_entry = tk.Entry(lin_tab, width=10)
+lin_n_entry.grid(row=1, column=1, sticky="w")
+
+tk.Button(lin_tab, text="Run Linear Skip", bg="sky blue",
+          command=linear_skip_run).grid(row=2, column=1, pady=20)
+
+# -------------------------- 5 B : CV-Aware Skip
+cv_tab5 = tk.Frame(step5_nb)
+step5_nb.add(cv_tab5, text="CV-Aware Skip")
+
+cv_file_path = tk.StringVar()
+
+tk.Label(cv_tab5, text="CSV File:", font=("Arial", 10, "bold")
+         ).grid(row=0, column=0, sticky="e", padx=5, pady=5)
+tk.Entry(cv_tab5, textvariable=cv_file_path, width=50
+         ).grid(row=0, column=1, padx=5)
+tk.Button(cv_tab5, text="Browse…", command=cv_browse_and_suggest
+          ).grid(row=0, column=2, padx=5)
+
+# ---------------------------------------------------------------- CV parameters
+labels_cv = ["T_eq (s)", "E_begin (V)", "E_vertex1 (V)", "E_vertex2 (V)",
+             "Scan rate (V/s)", "Number of Scans"]
+entries_cv = {}
+
+for r, lbl in enumerate(labels_cv, start=1):
+    tk.Label(cv_tab5, text=lbl + ":", font=("Arial", 10, "bold")
+             ).grid(row=r, column=0, sticky="e", padx=5, pady=3)
+    ent = tk.Entry(cv_tab5, width=12)
+    ent.grid(row=r, column=1, sticky="w")
+    entries_cv[lbl] = ent
+
+# expose the entries to cv_skip_run()
+teq_entry = entries_cv["T_eq (s)"]
+e_begin_entry = entries_cv["E_begin (V)"]
+e_v1_entry = entries_cv["E_vertex1 (V)"]
+e_v2_entry = entries_cv["E_vertex2 (V)"]
+sr_entry = entries_cv["Scan rate (V/s)"]
+nsc_entry = entries_cv["Number of Scans"]
+
+# ------------- ΔV +tolerance widgets
+row = len(labels_cv) + 1
+
+tk.Label(cv_tab5, text="ΔV Interval (V):", font=("Arial", 10, "bold")
+         ).grid(row=row, column=0, sticky="e", padx=5, pady=5)
+dv_entry = tk.Entry(cv_tab5, width=12)
+dv_entry.grid(row=row, column=1, sticky="w")
+sugg_dv_lbl = tk.Label(cv_tab5, text="Suggested: —", fg="gray")
+sugg_dv_lbl.grid(row=row, column=2, sticky="w")
+
+row += 1
+tk.Label(cv_tab5, text="+ve Tol (V):", font=("Arial", 10, "bold")
+         ).grid(row=row, column=0, sticky="e", padx=5, pady=3)
+pos_entry = tk.Entry(cv_tab5, width=12)
+pos_entry.grid(row=row, column=1, sticky="w")
+sugg_pos_lbl = tk.Label(cv_tab5, text="± —", fg="gray")
+sugg_pos_lbl.grid(row=row, column=2, sticky="w")
+
+row += 1
+tk.Label(cv_tab5, text="-ve Tol (V):", font=("Arial", 10, "bold")
+         ).grid(row=row, column=0, sticky="e", padx=5, pady=3)
+neg_entry = tk.Entry(cv_tab5, width=12)
+neg_entry.grid(row=row, column=1, sticky="w")
+sugg_neg_lbl = tk.Label(cv_tab5, text="± —", fg="gray")
+sugg_neg_lbl.grid(row=row, column=2, sticky="w")
+
+# ----------------- Run button
+tk.Button(cv_tab5, text="Run CV-Aware Skip", bg="sky blue",
+          command=cv_skip_run).grid(row=row + 1, column=1, pady=20)
+
+# -------------------------------------------------------------- footer / exit
+tk.Button(root, text="Exit Application", command=exit_application,
+          bg="tomato").pack(pady=10)
+
+tk.Label(root,
+         text="Made by Pavithra Gunasekaran + ChatGPT "
+              "(pavijovi3@gmail.com)",
+         font=("Helvetica", 8)).pack(pady=10)
+
+# -------------------------------------------------------------- main loop
+root.mainloop()
