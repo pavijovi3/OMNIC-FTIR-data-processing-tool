@@ -42,6 +42,69 @@ global_e_end_lv = None
 global_scan_rate_lv = None
 
 
+# ------------------------------------------------------------------ helpers
+def _popup_if_network_error(exc, parent=None, filelabel="file"):
+    """
+    Return True iff *exc* looks like WinError 59 (“unexpected network error”)
+    and shows a custom, high-visibility popup.  Otherwise returns False so
+    the caller can fall back to the normal error box.
+    """
+    msg_lower = str(exc).lower()
+    win_err = getattr(exc, "winerror", None)
+
+    is_network = (win_err == 59) or ("network error" in msg_lower)
+    if not is_network:
+        return False  # let caller handle as usual
+
+    # ------------------------ bespoke modal dialog -------------------------
+    root = parent or window  # main window fallback
+    dlg = tk.Toplevel(root)
+    dlg.title("Network drive detected")
+    dlg.transient(root)  # stay on top
+    dlg.grab_set()  # modal
+    dlg.resizable(False, False)
+
+    PAD = 12
+    body = tk.Frame(dlg, padx=PAD, pady=PAD)
+    body.pack()
+
+    # Big heading
+    tk.Label(
+        body, text="Unable to read the " + filelabel,
+        font=("Helvetica", 20, "bold"), fg="red"
+    ).pack(anchor="w", pady=(0, PAD))
+
+    # Yellow highlighted advice
+    tk.Label(
+        body,
+        text=("Please copy the data to a LOCAL disk\n"
+              "or a OneDrive-synced folder and run again."),
+        font=("Helvetica", 18, "bold"),
+        bg="yellow", justify="left", wraplength=560
+    ).pack(anchor="w", pady=(0, PAD))
+
+    # Original Windows message (smaller, grey)
+    tk.Label(
+        body, text=f"Windows reported:\n{exc}",
+        font=("Helvetica", 12), fg="gray40", justify="left", wraplength=560
+    ).pack(anchor="w")
+
+    # OK button
+    btn = ttk.Button(dlg, text="OK", command=dlg.destroy)
+    btn.pack(pady=(PAD, 0))
+    btn.focus_set()
+
+    # Centre over parent
+    dlg.update_idletasks()
+    w, h = dlg.winfo_width(), dlg.winfo_height()
+    px = root.winfo_rootx() + (root.winfo_width() - w) // 2
+    py = root.winfo_rooty() + (root.winfo_height() - h) // 2
+    dlg.geometry(f"{w}x{h}+{px}+{py}")
+
+    root.wait_window(dlg)  # block until closed
+    return True  # tell caller we handled it
+
+
 # ----------------------- Helper Function for CV Voltage Calculation -----------------------
 def calculate_cv_voltage(t, params):
     E_begin = params['E_begin']
@@ -85,52 +148,69 @@ def file_has_header(file_path, header_keywords=["wavenumbers", "cm^-1", "absorba
         return False
 
 
-# ----------------------- STEP 1: Convert OMNIC Files -----------------------
+# ----------------------- STEP 1 : Convert selected SPA files -----------------------
 def convert_spa_folder_individual():
-    folder = filedialog.askdirectory(title="Select Folder Containing SPA Files")
-    if not folder:
-        return
-    spa_files = [f for f in os.listdir(folder) if f.lower().endswith('.spa')]
-    if not spa_files:
-        messagebox.showerror("Error", "No .spa files found.", parent=window)
+    # ► pick one or many *.spa files rather than a folder
+    spa_paths = filedialog.askopenfilenames(
+        title="Select SPA file(s) to convert",
+        filetypes=[("Thermo OMNIC SPA files", "*.spa")],
+        parent=window
+    )
+    if not spa_paths:                       # user hit Cancel
         return
 
-    pwin = tk.Toplevel(window);
+    # progress window ---------------------------------------------------------
+    pwin = tk.Toplevel(window)
     pwin.title("Converting SPA → CSV")
     ttk.Label(pwin, text="Converting each SPA to its own CSV…").pack(pady=(10, 0))
     pb = ttk.Progressbar(pwin, orient="horizontal", length=400, mode="determinate")
-    pb["maximum"] = len(spa_files);
-    pb.pack(padx=20, pady=10);
+    pb["maximum"] = len(spa_paths)
+    pb.pack(padx=20, pady=10)
     pwin.update()
 
+    # worker ------------------------------------------------------------------
     def _task(path):
         ds = scp.read_omnic(path)
-        if ds is None: raise ValueError("Unsupported .spa file")
+        if ds is None:
+            raise ValueError("Unsupported .spa file")
         out_csv = os.path.splitext(path)[0] + ".csv"
         spec = ds if ds.ndim == 1 else ds[0]
         spec.write_csv(out_csv)
 
-    errors = []
+    errors, any_error, network_error_seen = [], False, False
+
     with ThreadPoolExecutor() as pool:
-        futures = {pool.submit(_task, os.path.join(folder, fn)): fn for fn in spa_files}
+        futures = {pool.submit(_task, p): os.path.basename(p) for p in spa_paths}
         done = 0
         for fut in as_completed(futures):
-            fn = futures[fut]
+            name = futures[fut]
             try:
                 fut.result()
             except Exception as e:
-                errors.append(f"{fn}: {e}")
-            done += 1;
-            pb["value"] = done;
+                any_error = True
+                handled = False
+                if not network_error_seen:
+                    handled = _popup_if_network_error(e, parent=window, filelabel="SPA file")
+                    if handled:
+                        network_error_seen = True
+                if not handled:
+                    errors.append(f"{name}: {e}")
+            done += 1
+            pb["value"] = done
             pwin.update_idletasks()
 
     pwin.destroy()
-    if errors:
-        messagebox.showerror("Errors", "\n".join(errors), parent=window)
+
+    if any_error:
+        if errors:
+            messagebox.showerror("Errors while converting SPA files",
+                                 "\n".join(errors), parent=window)
+        # else only WinError-59 pop-up already shown once
     else:
-        messagebox.showinfo("Done", "All SPA files converted.", parent=window)
+        messagebox.showinfo("Done", "All selected SPA files converted successfully.",
+                            parent=window)
 
-
+# ----------------------- Convert OMNIC SRS Files -----------------------
 def convert_srs_file_combined():
     file_path = filedialog.askopenfilename(
         title="Select an SRS File",
@@ -171,7 +251,8 @@ def convert_srs_file_combined():
                             parent=window
                             )
     except Exception as e:
-        messagebox.showerror("Error", str(e), parent=window)
+        if not _popup_if_network_error(e, parent=window, filelabel="SRS file"):
+            messagebox.showerror("Error", str(e), parent=window)
 
 
 # ----------------------- Step 2 Functions: CSV Combination -----------------------
@@ -551,33 +632,55 @@ def rename_columns_lv():
         rename_columns_lv_button.config(state=tk.NORMAL)
 
 
+# ----------------------- Step 3C : Time-based header renaming -----------------------
 def rename_headers_based_on_time():
-    global filename_step4
     fn = filedialog.askopenfilename(
-        title="Select CSV for Time Rename", filetypes=[("CSV files", "*.csv")]
+        title="Select CSV for Time Rename",
+        filetypes=[("CSV files", "*.csv")],
+        parent=window,
     )
     if not fn:
         return
-    status_label.config(text="Renaming Time-based Headers...", fg="blue")
+
+    status_label.config(text="Renaming Time-based Headers…", fg="blue")
     rename_time_button.config(state=tk.DISABLED)
     window.update_idletasks()
+
     try:
+        # ── load data ─────────────────────────────────────────────────────────
         df = pd.read_csv(fn)
-        total = simpledialog.askfloat("Input", "Total Time Collected (seconds):")
-        if total is None:
-            return
-        ncols = len(df.columns) - 1
-        dt = total / ncols
-        df.columns = ["Wavenumber"] + [f"{i * dt:.3f}s" for i in range(ncols)]
+
+        # ── ask the user for total duration ──────────────────────────────────
+        total = simpledialog.askfloat(
+            "Input",
+            "Total Time Collected (seconds):",
+            parent=window,
+        )
+        if total is None or total <= 0:
+            raise ValueError("Total time must be a positive number.")
+
+        # ── compute Δt and mid-points ────────────────────────────────────────
+        ncols = len(df.columns) - 1              # spectra only (exclude wavenumber)
+        dt    = total / ncols                    # acquisition window per spectrum
+
+        # Mid-point labels: (i + 0.5)·Δt  →  0.5·Δt, 1.5·Δt, …
+        new_headers = ["Wavenumber"] + [f"{(i + 0.5) * dt:.3f}s" for i in range(ncols)]
+        df.columns = new_headers
+
+        # ── save ----------------------------------------------------------------
         out = os.path.splitext(fn)[0] + "_renamed_Time.csv"
         df.to_csv(out, index=False)
+
         messagebox.showinfo("Success", f"Saved: {out}", parent=window)
         status_label.config(text="Completed", fg="green")
-    except:
-        messagebox.showerror("Error", "Enter valid number", parent=window)
+
+    except Exception as e:
+        messagebox.showerror("Error", str(e), parent=window)
         status_label.config(text="Error", fg="red")
+
     finally:
         rename_time_button.config(state=tk.NORMAL)
+
 
 
 # ----------------------- Step 4: Background Reprocessing -----------------------
@@ -602,12 +705,12 @@ def bg_processing():
         return
 
     # choose column dialog
-    chooser = tk.Toplevel(window);
+    chooser = tk.Toplevel(window)
     chooser.title("Select Background Column")
     cols = [c for c in df.columns if c != "Wavenumber"]
     width = max(30, max(len(str(c)) for c in cols) // 2)
     ttk.Label(chooser, text="Choose a column:").pack(pady=5)
-    cb = ttk.Combobox(chooser, values=cols, width=width);
+    cb = ttk.Combobox(chooser, values=cols, width=width)
     cb.pack(pady=5)
 
     def confirm():
@@ -689,13 +792,13 @@ def cv_browse_and_suggest():
     if len(volts) < 2:
         return
     dV_sugg = (max(volts) - min(volts)) / (len(volts) - 1)
-    dv_entry.delete(0, tk.END);
+    dv_entry.delete(0, tk.END)
     dv_entry.insert(0, f"{dV_sugg:.4f}")
     sugg_dv_lbl.config(text=f"Suggested: {dV_sugg:.4f} V")
-    pos_entry.delete(0, tk.END);
+    pos_entry.delete(0, tk.END)
     pos_entry.insert(0, f"{dV_sugg:.4f}")
     sugg_pos_lbl.config(text=f"±{dV_sugg:.4f}")
-    neg_entry.delete(0, tk.END);
+    neg_entry.delete(0, tk.END)
     neg_entry.insert(0, f"{dV_sugg:.4f}")
     sugg_neg_lbl.config(text=f"±{dV_sugg:.4f}")
 
@@ -739,7 +842,7 @@ def cv_skip_run():
     for Ev in (Eb, Ev1, Ev2):
         cands = [i for i, v in enumerate(voltages, start=1) if Ev - tol_n <= v <= Ev + tol_p]
         if cands:
-            keep.add(cands[0]);
+            keep.add(cands[0])
             keep.add(cands[-1])
 
     # uniform ΔV sampling (both passes)
@@ -748,7 +851,7 @@ def cv_skip_run():
     for target in steps:
         cands = [i for i, v in enumerate(voltages, start=1) if target - tol_n <= v <= target + tol_p]
         if cands:
-            keep.add(cands[0]);
+            keep.add(cands[0])
             keep.add(cands[-1])
 
     keep_list = sorted(keep)
@@ -757,7 +860,7 @@ def cv_skip_run():
     base, _ = os.path.splitext(path)
     out_path = f"{base}_dV{dV:.3f}.csv"
     with open(path, newline='') as fin, open(out_path, 'w', newline='') as fout:
-        rdr = csv.reader(fin);
+        rdr = csv.reader(fin)
         wtr = csv.writer(fout)
         orig = next(rdr)
         wtr.writerow([orig[i] for i in keep_list])
@@ -770,7 +873,7 @@ def cv_skip_run():
 # ----------------------- Main GUI: Notebook Tabbed Layout -----------------------
 root = tk.Tk()
 root.title("FTIR Data Processing_V11")
-root.geometry("720x800")
+root.geometry("1100x750")
 window = root
 
 
@@ -812,23 +915,23 @@ tk.Label(step1_tab, text="SPA & SRS to CSV Converter",
 
 tk.Label(
     step1_tab,
-    text=("Important — store program & data on local disk or OneDrive; "
+    text=("Important: Save data files on local disk or OneDrive; "
           "network drives will not work."),
-    font=("Helvetica", 10, "bold"), fg="red", bg="light yellow",
+    font=("Helvetica", 14, "bold"), fg="red", bg="yellow",
     wraplength=500
 ).pack(pady=10)
 
-tk.Button(step1_tab, text="Convert SPA → each CSV",
-          font=("Helvetica", 10), bg="sky blue",
+tk.Button(step1_tab, text="Convert SPA files → each CSV",
+          font=("Helvetica", 11), bg="sky blue",
           command=convert_spa_folder_individual).pack(pady=5)
 
 tk.Button(step1_tab, text="Convert SRS → combined CSV",
-          font=("Helvetica", 10), bg="sky blue",
+          font=("Helvetica", 11), bg="sky blue",
           command=convert_srs_file_combined).pack(pady=5)
 
 tk.Label(step1_tab,
-         text="Converted CSV files will be saved alongside the source.",
-         font=("Helvetica", 9, "italic"), fg="blue").pack(pady=10)
+         text="Converted CSV files will be saved in the same directory as the source file.",
+         font=("Helvetica", 11, "italic"), fg="blue").pack(pady=10)
 
 # =================================================================== STEP 2 ===
 step2_tab = tk.Frame(main_notebook)
@@ -840,12 +943,12 @@ tk.Label(step2_tab, text="Combine CSV files",
 step2_nb = ttk.Notebook(step2_tab)  # ← use this name consistently
 step2_nb.pack(fill="both", expand=True, padx=10, pady=10)
 
-# ---- 2 A : Series collection
+# ---- 2A : Series collection
 series_tab = tk.Frame(step2_nb)
 step2_nb.add(series_tab, text="Series Collection CSV")
 
 tk.Label(series_tab, text="Combine Series Collection CSV Files",
-         font=("Helvetica", 10, "bold"), fg="blue").pack(pady=10)
+         font=("Helvetica", 11, "bold"), fg="blue").pack(pady=10)
 
 combine_csv_button = tk.Button(series_tab, text="Click to Combine CSV Files",
                                command=combine_series_csv_to_csv, bg="sky blue")
@@ -853,18 +956,18 @@ combine_csv_button.pack(pady=5)
 
 tk.Label(series_tab,
          text="Note : Sort if >5k files; headers may not align.",
-         font=("Helvetica", 9, "italic"), fg="blue").pack(pady=5)
+         font=("Helvetica", 11, "italic"), fg="blue").pack(pady=5)
 
 sort_button = tk.Button(series_tab, text="Sort Spectral Columns",
                         command=sort_spectral_columns, bg="sky blue")
 sort_button.pack(pady=5)
 
-# ---- 2 B : Time-resolved (step-scan)
+# ---- 2B : Time-resolved (step-scan)
 time_tab = tk.Frame(step2_nb)
 step2_nb.add(time_tab, text="Step-Scan Time-Resolved CSV")
 
 tk.Label(time_tab, text="Combine Step-Scan Time-Resolved CSV Files",
-         font=("Helvetica", 10, "bold"), fg="blue").pack(pady=10)
+         font=("Helvetica", 11, "bold"), fg="blue").pack(pady=10)
 
 time_resolved_csv_button = tk.Button(
     time_tab, text="Click to Combine SSTR CSV Files",
@@ -882,7 +985,7 @@ tk.Label(step3_tab, text="Rename Column Headers",
 step3_nb = ttk.Notebook(step3_tab)
 step3_nb.pack(fill="both", expand=True, padx=10, pady=10)
 
-# ------------------- 3 A : CV
+# ------------------- 3A : CV
 cv_tab = tk.Frame(step3_nb)
 step3_nb.add(cv_tab, text="CV Voltage Range")
 
@@ -892,9 +995,9 @@ settings_frame_cv.pack(fill="x", anchor="nw")
 get_cv_settings()
 
 potential_change_label_cv = tk.Label(
-    cv_tab, bg="white", fg="black",
+    cv_tab, bg="green yellow", fg="black",
     text="Potential Change per Spectrum: 0.000000 V/sec",
-    font=("Helvetica", 10)
+    font=("Helvetica", 12)
 )
 potential_change_label_cv.pack(pady=10)
 
@@ -904,7 +1007,7 @@ rename_columns_cv_button = tk.Button(
 )
 rename_columns_cv_button.pack(pady=5)
 
-# ------------------- 3 B : LV
+# ------------------- 3B : LV
 lv_tab = tk.Frame(step3_nb)
 step3_nb.add(lv_tab, text="LV Voltage Range")
 
@@ -914,9 +1017,9 @@ settings_frame_lv.pack(fill="x", anchor="nw")
 get_lv_settings()
 
 potential_change_label_lv = tk.Label(
-    lv_tab, bg="white", fg="black",
+    lv_tab, bg="green yellow", fg="black",
     text="Potential Change per Spectrum: 0.000000 V/sec",
-    font=("Helvetica", 10)
+    font=("Helvetica", 12)
 )
 potential_change_label_lv.pack(pady=10)
 
@@ -930,11 +1033,18 @@ rename_columns_lv_button.pack(pady=5)
 tb_tab = tk.Frame(step3_nb)
 step3_nb.add(tb_tab, text="Time-Based Labeling")
 
-tk.Label(tb_tab,
-         text=("Use this if you know total scan duration to label headers\n"
-               "like 0.000 s, 0.250 s …"),
-         font=("Helvetica", 9, "italic", "bold"),
-         fg="purple").pack(pady=10)
+tk.Label(
+    tb_tab,
+    text=("Use this if you know the total scan duration\n"
+          "and the tool will rename each spectral column"
+          "to the MID-POINT of its acquisition time.\n"
+          "(e.g. 0.125 s, 0.375 s, 0.625 s …)"),
+    font=("Helvetica", 11, "italic", "bold"),
+    fg="blue",
+    wraplength=700          # ← line added
+).pack(pady=10)
+
+
 
 rename_time_button = tk.Button(
     tb_tab, text="Rename Headers Based on Time Intervals",
@@ -952,8 +1062,8 @@ tk.Label(step4_tab, text="Reprocess Background",
 tk.Label(step4_tab,
          text=("Logic : Choose a background column and subtract it from all "
                "others\n(I_reprocessed = I_original − I_background)"),
-         font=("Helvetica", 10), fg="blue",
-         wraplength=400, justify="center").pack(pady=(0, 10))
+         font=("Helvetica", 11), fg="blue",
+         wraplength=500, justify="center").pack(pady=(0, 10))
 
 process_background_data_button = tk.Button(
     step4_tab, text="Reprocess Background",
@@ -971,32 +1081,73 @@ tk.Label(step5_tab, text="Skip Spectral Columns",
 step5_nb = ttk.Notebook(step5_tab)
 step5_nb.pack(fill="both", expand=True, padx=10, pady=10)
 
-# -------------------------- 5 A : Linear Skip
+# -------------------------- 5A : Linear Skip ---------------------------------
 lin_tab = tk.Frame(step5_nb)
 step5_nb.add(lin_tab, text="Linear Skip")
 
+# Make the whole tab centre-friendly
+lin_tab.columnconfigure(0, weight=1)
+
+# --- centred instruction banner ---------------------------------------------
+tk.Label(
+    lin_tab,
+    text=("Linear skip keeps the first and last spectral columns, then skips "
+          "every n columns and keeps the (n + 1)-th.\n\n"
+          "Example: n = 2  →  keeps columns 1, 4, 7, 10 … plus the last."),
+    font=("Arial", 12),
+    fg="blue",
+    wraplength=600,
+    justify="center"
+).grid(row=0, column=0, pady=(0, 15), sticky="n")
+
+# --- form area ---------------------------------------------------------------
+form = tk.Frame(lin_tab)          # inner frame, auto-centred by parent grid
+form.grid(row=1, column=0)
+
 lin_file_path = tk.StringVar()
 
-tk.Label(lin_tab, text="CSV File:", font=("Arial", 10, "bold")
+tk.Label(form, text="CSV File:", font=("Arial", 10, "bold")
          ).grid(row=0, column=0, sticky="e", padx=5, pady=5)
-tk.Entry(lin_tab, textvariable=lin_file_path, width=50
+tk.Entry(form, textvariable=lin_file_path, width=50
          ).grid(row=0, column=1, padx=5)
-tk.Button(lin_tab, text="Browse…", command=linear_browse
+tk.Button(form, text="Browse…", command=linear_browse
           ).grid(row=0, column=2, padx=5)
 
-tk.Label(lin_tab, text="Skip n:", font=("Arial", 10, "bold")
+tk.Label(form, text="Number of columns to skip:", font=("Arial", 10, "bold")
          ).grid(row=1, column=0, sticky="e", padx=5, pady=5)
-lin_n_entry = tk.Entry(lin_tab, width=10)
+lin_n_entry = tk.Entry(form, width=10)
 lin_n_entry.grid(row=1, column=1, sticky="w")
 
-tk.Button(lin_tab, text="Run Linear Skip", bg="sky blue",
-          command=linear_skip_run).grid(row=2, column=1, pady=20)
+tk.Button(
+    form, text="Run Linear Skip", bg="sky blue",
+    command=linear_skip_run
+).grid(row=2, column=1, pady=20)
+
 
 # -------------------------- 5 B : CV-Aware Skip
 cv_tab5 = tk.Frame(step5_nb)
 step5_nb.add(cv_tab5, text="CV-Aware Skip")
 
 cv_file_path = tk.StringVar()
+# --- 5B : CV-Aware Skip  (SIDE HELP PANEL) ------------------------------
+cv_help = tk.Text(
+    cv_tab5, font=("Arial", 12), fg="blue", width=38, height=16, wrap="word",
+    bg=root.cget("bg"), relief="flat", borderwidth=0
+)
+cv_help.insert(
+    "1.0",
+    "CV-aware skip keeps:\n"
+    " • The first and last spectra\n"
+    " • Both spectra at each defined vertex (E_begin, E_vertex1, E_vertex2)\n"
+    " • The first and last spectrum within every ΔV interval "
+    "across the cycle (using the ± tolerances)\n\n"
+    "Result: a compact data set that still covers all key voltages "
+    "and samples uniformly in between."
+)
+cv_help.configure(state="disabled")
+# Place to the right of the parameter grid
+cv_help.grid(row=0, column=3, rowspan=20, sticky="nw", padx=(20, 0), pady=5)
+
 
 tk.Label(cv_tab5, text="CSV File:", font=("Arial", 10, "bold")
          ).grid(row=0, column=0, sticky="e", padx=5, pady=5)
