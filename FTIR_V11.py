@@ -18,6 +18,8 @@ input_file_label_cv = None
 file_label_lv = None
 filename_step4 = ""
 df_step4 = None
+rapid_scan_var = None
+
 
 # GUI Buttons (initialized later)
 combine_csv_button = None
@@ -156,7 +158,7 @@ def convert_spa_folder_individual():
         filetypes=[("Thermo OMNIC SPA files", "*.spa")],
         parent=window
     )
-    if not spa_paths:                       # user hit Cancel
+    if not spa_paths:  # user hit Cancel
         return
 
     # progress window ---------------------------------------------------------
@@ -210,6 +212,7 @@ def convert_spa_folder_individual():
         messagebox.showinfo("Done", "All selected SPA files converted successfully.",
                             parent=window)
 
+
 # ----------------------- Convert OMNIC SRS Files -----------------------
 def convert_srs_file_combined():
     file_path = filedialog.askopenfilename(
@@ -217,24 +220,29 @@ def convert_srs_file_combined():
         filetypes=[("SRS files", "*.srs")],
         parent=window
     )
-    if not file_path: return
+    if not file_path:
+        return
 
     try:
         ds = scp.read_omnic(file_path)
         if ds is None or ds.ndim != 2:
             raise ValueError("Expected a 2D dataset from SRS.")
-        ds.data = ds.data[:, ::-1]
+
+        # only flip if NOT rapid scan
+        if not rapid_scan_var.get():
+            ds.data = ds.data[:, ::-1]
+
         x = ds.x.data
         n_spec, n_pts = ds.data.shape
         base, _ = os.path.splitext(file_path)
         out_csv = f"{base}_combined.csv"
 
-        pwin = tk.Toplevel(window);
+        pwin = tk.Toplevel(window)
         pwin.title("Exporting SRS → CSV")
         ttk.Label(pwin, text="Writing rows to CSV…").pack(pady=(10, 0))
         pb = ttk.Progressbar(pwin, orient="horizontal", length=400, mode="determinate")
-        pb["maximum"] = n_pts;
-        pb.pack(padx=20, pady=10);
+        pb["maximum"] = n_pts
+        pb.pack(padx=20, pady=10)
         pwin.update()
 
         with open(out_csv, "w", newline="") as f:
@@ -242,14 +250,15 @@ def convert_srs_file_combined():
             writer.writerow(["Wavenumber"] + [f"Spectrum {i + 1}" for i in range(n_spec)])
             for i in range(n_pts):
                 writer.writerow([x[i]] + ds.data[:, i].tolist())
-                pb["value"] = i + 1;
+                pb["value"] = i + 1
                 pwin.update_idletasks()
 
         pwin.destroy()
-        messagebox.showinfo("Success",
-                            f"{n_spec} spectra × {n_pts} points written to:\n{out_csv}",
-                            parent=window
-                            )
+        messagebox.showinfo(
+            "Success",
+            f"{n_spec} spectra × {n_pts} points written to:\n{out_csv}",
+            parent=window
+        )
     except Exception as e:
         if not _popup_if_network_error(e, parent=window, filelabel="SRS file"):
             messagebox.showerror("Error", str(e), parent=window)
@@ -660,8 +669,8 @@ def rename_headers_based_on_time():
             raise ValueError("Total time must be a positive number.")
 
         # ── compute Δt and mid-points ────────────────────────────────────────
-        ncols = len(df.columns) - 1              # spectra only (exclude wavenumber)
-        dt    = total / ncols                    # acquisition window per spectrum
+        ncols = len(df.columns) - 1  # spectra only (exclude wavenumber)
+        dt = total / ncols  # acquisition window per spectrum
 
         # Mid-point labels: (i + 0.5)·Δt  →  0.5·Δt, 1.5·Δt, …
         new_headers = ["Wavenumber"] + [f"{(i + 0.5) * dt:.3f}s" for i in range(ncols)]
@@ -682,54 +691,107 @@ def rename_headers_based_on_time():
         rename_time_button.config(state=tk.NORMAL)
 
 
+# ────────────────────────────────
+# Polars helper for fast time-header normalization
+def normalize_time_headers_polars(csv_path: str, ref_time: float) -> str:
+    df = pl.read_csv(csv_path)
+    old = df.columns
+    new = [old[0]] + [
+        (lambda m: f"{float(m.group(1)) - ref_time:.3f}s")(re.search(r"([-+]?\d*\.?\d+)\s*s?$", c))
+        if re.search(r"([-+]?\d*\.?\d+)\s*s?$", c) else c
+        for c in old[1:]
+    ]
+    df = df.rename({o: n for o, n in zip(old, new)})
+    out = os.path.splitext(csv_path)[0] + f"_normRef{ref_time:.3f}.csv"
+    df.write_csv(out)
+    return out
+
+
+def run_normalize():
+    path = norm_file_path.get()
+    if not path or not os.path.isfile(path):
+        messagebox.showerror("Error", "Select a valid CSV", parent=window)
+        return
+    try:
+        ref = float(norm_ref_entry.get())
+    except:
+        messagebox.showerror("Error", "Enter numeric reference time", parent=window)
+        return
+    try:
+        out = normalize_time_headers_polars(path, ref)
+        messagebox.showinfo("Done", f"Saved:\n{out}", parent=window)
+    except Exception as e:
+        messagebox.showerror("Error", str(e), parent=window)
+
 
 # ----------------------- Step 4: Background Reprocessing -----------------------
 def bg_processing():
-    file_path = filedialog.askopenfilename(
-        title="Select Input File",
-        filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx")]
-    )
-    if not file_path: return
-
-    status_label.config(text="Reprocessing Background...", fg="blue")
-    process_background_data_button.config(state=tk.DISABLED)
-    window.update_idletasks()
-
-    try:
-        ext = os.path.splitext(file_path)[1].lower()
-        df = pd.read_excel(file_path) if ext == '.xlsx' else pd.read_csv(file_path)
-    except Exception as e:
-        messagebox.showerror("Error", f"Unsupported format: {e}", parent=window)
-        status_label.config(text="Idle", fg="green")
-        process_background_data_button.config(state=tk.NORMAL)
+    file_path = filedialog.askopenfilename(title="Select Input File",
+                                           filetypes=[("CSV files", "*.csv")])
+    if not file_path:
         return
+    try:
+        status_label.config(text="Reprocessing Background...", fg="blue")
+        process_background_data_button.config(state=tk.DISABLED)
+        window.update_idletasks()
+        file_extension = os.path.splitext(file_path)[1].lower()
+        if file_extension == '.xlsx':
+            df = pd.read_excel(file_path)
+        elif file_extension == '.csv':
+            df = pd.read_csv(file_path)
+        else:
+            messagebox.showerror("Error", "Unsupported file format.", parent=window)
+            raise ValueError("Unsupported file format")
+        column_window = tk.Tk()
+        column_window.title("Select Column")
+        max_column_name_length = max(len(str(col)) for col in df.columns)
+        combobox_width = max(30, max_column_name_length // 2)
+        column_label = ttk.Label(column_window, text="Choose a column:")
+        column_label.pack(pady=5)
+        sanitized_column_names = [str(col) for col in df.columns if col != "Wavenumber"]
+        column_combobox = ttk.Combobox(column_window, values=sanitized_column_names, width=combobox_width)
+        column_combobox.pack(pady=5)
+        column_combobox.current(0)  # default to the first spectral column
 
-    # choose column dialog
-    chooser = tk.Toplevel(window)
-    chooser.title("Select Background Column")
-    cols = [c for c in df.columns if c != "Wavenumber"]
-    width = max(30, max(len(str(c)) for c in cols) // 2)
-    ttk.Label(chooser, text="Choose a column:").pack(pady=5)
-    cb = ttk.Combobox(chooser, values=cols, width=width)
-    cb.pack(pady=5)
+        def on_confirm():
+            chosen_column = column_combobox.get()
+            if not chosen_column:
+                messagebox.showerror("Error", "No column selected.", parent=window)
+                return
+            column_window.destroy()
+            process_and_save(chosen_column, file_path, df)
+            status_label.config(text="Completed", fg="green")
+            process_background_data_button.config(state=tk.NORMAL)
 
-    def confirm():
-        col = cb.get()
-        if not col:
-            messagebox.showerror("Error", "No column selected", parent=window)
-            return
-        chooser.destroy()
-        out_df = df.copy()
-        for c in df.columns:
-            if c != "Wavenumber":
-                out_df[c] = df[c] - (df[col] if c != col else 0)
-        out = os.path.splitext(file_path)[0] + f"_{col}.csv"
-        out_df.to_csv(out, index=False)
-        messagebox.showinfo("Success", f"Saved: {out}", parent=window)
+        confirm_button = ttk.Button(column_window, text="Confirm", command=on_confirm)
+        confirm_button.pack(pady=5)
+        column_window.geometry(f"{combobox_width * 10}x150")
+        column_window.mainloop()
+    except Exception as e:
+        messagebox.showerror("Error", f"An error occurred: {str(e)}", parent=window)
         status_label.config(text="Idle", fg="green")
+    finally:
         process_background_data_button.config(state=tk.NORMAL)
 
-    ttk.Button(chooser, text="Confirm", command=confirm).pack(pady=5)
+
+def process_and_save(chosen_column, file_path, df):
+    # subtract in one go:
+    #   take all spectral cols, subtract the background column along rows
+    spectral = df.drop(columns="Wavenumber")
+    background = df[chosen_column]
+    subtracted = spectral.subtract(background, axis=0)
+
+    # re-attach the Wavenumber column up front
+    processed = pd.concat(
+        [df[["Wavenumber"]], subtracted],
+        axis=1,
+        copy=False  # avoid an extra copy if you like
+    )
+
+    out = os.path.splitext(file_path)[0] + f"_{chosen_column}.csv"
+    processed.to_csv(out, index=False)
+    messagebox.showinfo("Success", f"File saved as {out}", parent=window)
+    status_label.config(text="Idle", fg="green")
 
 
 # ----------------------- STEP 5: Skip Spectral Columns (Linear & CV-Aware) -----------------------
@@ -838,21 +900,25 @@ def cv_skip_run():
     last = len(hdr) - 1
     keep = {0, 1, last}
 
-    # vertex windows (first & last match)
+    # ---------------------------------------------------------------- vertex windows
     for Ev in (Eb, Ev1, Ev2):
-        cands = [i for i, v in enumerate(voltages, start=1) if Ev - tol_n <= v <= Ev + tol_p]
+        cands = [i for i, v in enumerate(voltages, start=1)
+                 if Ev - tol_n <= v <= Ev + tol_p]
         if cands:
-            keep.add(cands[0])
-            keep.add(cands[-1])
+            keep.add(cands[0])  # first match (leave as-is)
+            keep.add(cands[-1])  # last match (leave as-is)
 
-    # uniform ΔV sampling (both passes)
+    # ---------------------------------------------------------------- uniform ΔV sampling
     vmin, vmax = min(voltages), max(voltages)
-    steps = np.arange(vmin, vmax + dV / 2, dV)
+    steps = np.arange(vmin, vmax + dV / 2, dV)  # target grid
+
     for target in steps:
-        cands = [i for i, v in enumerate(voltages, start=1) if target - tol_n <= v <= target + tol_p]
+        # indices (1-based) whose header lies inside the tolerance window
+        cands = [i for i, v in enumerate(voltages, start=1)
+                 if target - tol_n <= v <= target + tol_p]
         if cands:
-            keep.add(cands[0])
-            keep.add(cands[-1])
+            keep.add(cands[0])  # ← ascending
+            keep.add(cands[-1])  # ← descending
 
     keep_list = sorted(keep)
 
@@ -870,12 +936,94 @@ def cv_skip_run():
     messagebox.showinfo("Done", f"Saved: {out_path}", parent=root)
 
 
+# ───────────────────────────────────────────────────  Time-Crop helpers
+crop_values = []              # list of numeric header values
+
+def crop_browse():
+    global crop_values
+    path = filedialog.askopenfilename(
+        title="Select CSV to crop",
+        filetypes=[("CSV files", "*.csv")],
+        parent=window
+    )
+    if not path:
+        return
+    crop_file_path.set(path)
+
+    # parse the first header row, extract all numbers
+    with open(path, newline="") as fh:
+        hdr = next(csv.reader(fh))
+    vals = []
+    for h in hdr[1:]:
+        m = re.search(r"([-+]?\d*\.?\d+)", h)
+        if m:
+            vals.append(float(m.group(1)))
+    if not vals:
+        messagebox.showwarning("No numeric headers",
+                               "Couldn't find any numbers in the headers.",
+                               parent=window)
+        crop_values = []
+        return
+
+    # sort & initialize
+    crop_values = sorted(vals)
+    n = len(crop_values)
+    crop_start.set(crop_values[0])
+    crop_stop.set(crop_values[-1])
+    sug_min_lbl.config(text=f"Min: {crop_values[0]:.3f}")
+    sug_max_lbl.config(text=f"Max: {crop_values[-1]:.3f}")
+    range_slider.configure(range=(0, n-1))
+    range_slider.set_values(0, n-1)
+
+def _snap_idx(val):
+    return min(range(len(crop_values)),
+               key=lambda i: abs(crop_values[i] - val))
+
+def on_crop_entry(event=None):
+    try:
+        i0 = _snap_idx(crop_start.get())
+        i1 = _snap_idx(crop_stop.get())
+        if i1 < i0:
+            i0, i1 = i1, i0
+        range_slider.set_values(i0, i1)
+        crop_start.set(crop_values[i0])
+        crop_stop.set(crop_values[i1])
+    except Exception:
+        pass
+
+def crop_run():
+    path = crop_file_path.get()
+    if not path or not os.path.isfile(path):
+        messagebox.showerror("Error", "Select a valid CSV", parent=window)
+        return
+    if not crop_values:
+        messagebox.showwarning("No data loaded", "Please browse a file first.", parent=window)
+        return
+
+    i0, i1 = range_slider.get_values()
+    keep = [0] + list(range(1 + i0, 1 + i1 + 1))
+    keep.sort()
+
+    base, _ = os.path.splitext(path)
+    out = f"{base}_{crop_values[i0]:.3f}-{crop_values[i1]:.3f}.csv"
+    with open(path, newline="") as fin, open(out, "w", newline="") as fout:
+        rdr, wtr = csv.reader(fin), csv.writer(fout)
+        hdr = next(rdr)
+        wtr.writerow([hdr[k] for k in keep])
+        for row in rdr:
+            wtr.writerow([row[k] for k in keep])
+
+    messagebox.showinfo("Done", f"Saved:\n{out}", parent=window)
+
 # ----------------------- Main GUI: Notebook Tabbed Layout -----------------------
 root = tk.Tk()
 root.title("FTIR Data Processing_V11")
 root.geometry("1100x750")
 window = root
-
+rapid_scan_var = tk.BooleanVar(value=False)
+crop_file_path   = tk.StringVar()
+crop_start       = tk.DoubleVar()
+crop_stop        = tk.DoubleVar()
 
 def exit_application() -> None:
     root.quit()
@@ -921,13 +1069,34 @@ tk.Label(
     wraplength=500
 ).pack(pady=10)
 
-tk.Button(step1_tab, text="Convert SPA files → each CSV",
-          font=("Helvetica", 11), bg="sky blue",
-          command=convert_spa_folder_individual).pack(pady=5)
+# ───────── SPA Conversion ─────────
+spa_frame = tk.LabelFrame(step1_tab, text="Convert SPA Files", padx=10, pady=10)
+spa_frame.pack(padx=20, pady=(0,10))   # no fill, centered by default
 
-tk.Button(step1_tab, text="Convert SRS → combined CSV",
-          font=("Helvetica", 11), bg="sky blue",
-          command=convert_srs_file_combined).pack(pady=5)
+tk.Button(spa_frame,
+          text="Convert SPA files → each CSV",
+          font=("Helvetica", 11),
+          bg="sky blue",
+          command=convert_spa_folder_individual
+).pack(pady=5)                        # centered
+
+# ───────── SRS Conversion ─────────
+srs_frame = tk.LabelFrame(step1_tab, text="Convert SRS Files", padx=10, pady=10)
+srs_frame.pack(padx=20, pady=(0,20))  # no fill, centered by default
+
+tk.Button(srs_frame,
+          text="Convert SRS → combined CSV",
+          font=("Helvetica", 11),
+          bg="sky blue",
+          command=convert_srs_file_combined
+).pack(pady=5)                        # centered
+
+tk.Checkbutton(srs_frame,
+               text="Rapid Scan/Ifg reprocessed (Flip wavenumbers)",
+               variable=rapid_scan_var,
+               font=("Helvetica", 12, "bold"),
+               padx=10, pady=6
+).pack(pady=5)                        # centered
 
 tk.Label(step1_tab,
          text="Converted CSV files will be saved in the same directory as the source file.",
@@ -1041,17 +1210,43 @@ tk.Label(
           "(e.g. 0.125 s, 0.375 s, 0.625 s …)"),
     font=("Helvetica", 11, "italic", "bold"),
     fg="blue",
-    wraplength=700          # ← line added
-).pack(pady=10)
-
-
+    wraplength=700  # ← line added
+).pack(pady=15)
 
 rename_time_button = tk.Button(
     tb_tab, text="Rename Headers Based on Time Intervals",
     bg="sky blue", command=rename_headers_based_on_time
 )
-rename_time_button.pack(pady=10)
+rename_time_button.pack(pady=15)
+# — new normalize-headers subsection —
+norm_frame = tk.LabelFrame(tb_tab, text="Normalize Time Headers", padx=10, pady=10)
+norm_frame.pack(fill="x", padx=20, pady=10)
 
+tk.Label(
+    norm_frame,
+    text="Use this if you want to subtract a reference time from each spectral header\n"
+         "(e.g. to shift your t₀ → 0 and rename 0.500s → 0.000s, etc.)",
+    font=("Helvetica", 10, "italic", "bold"),
+    fg="blue",
+    justify="left",
+    wraplength=500
+).grid(row=0, column=0, columnspan=3, pady=(0, 8))
+
+norm_file_path = tk.StringVar()
+tk.Label(norm_frame, text="CSV File:", font=("Arial", 10)).grid(row=1, column=0, sticky="e")
+tk.Entry(norm_frame, textvariable=norm_file_path, width=40).grid(row=1, column=1, padx=5)
+tk.Button(norm_frame, text="Browse…", bg="lightgray",
+          command=lambda: norm_file_path.set(
+              filedialog.askopenfilename(title="Select CSV", filetypes=[("CSV", "*.csv")])
+          )
+          ).grid(row=1, column=2)
+
+tk.Label(norm_frame, text="Reference t₀ (s):", font=("Arial", 10)).grid(row=2, column=0, sticky="e", pady=5)
+norm_ref_entry = tk.Entry(norm_frame, width=12)
+norm_ref_entry.grid(row=2, column=1, sticky="w")
+
+tk.Button(norm_frame, text="Normalize Headers", bg="sky blue", command=run_normalize) \
+    .grid(row=3, column=1, pady=10)
 # =================================================================== STEP 4 ===
 step4_tab = tk.Frame(main_notebook)
 main_notebook.add(step4_tab, text="Step 4 : Reprocess Background")
@@ -1073,9 +1268,9 @@ process_background_data_button.pack(pady=10)
 
 # =================================================================== STEP 5 ===
 step5_tab = tk.Frame(main_notebook)
-main_notebook.add(step5_tab, text="Step 5 : Skip Spectral Columns")
+main_notebook.add(step5_tab, text="Step 5 : Skip/Crop Spectral Columns")
 
-tk.Label(step5_tab, text="Skip Spectral Columns",
+tk.Label(step5_tab, text="Skip/Crop Spectral Columns",
          font=("Helvetica", 12, "bold"), fg="blue").pack(pady=(10, 5))
 
 step5_nb = ttk.Notebook(step5_tab)
@@ -1085,7 +1280,7 @@ step5_nb.pack(fill="both", expand=True, padx=10, pady=10)
 lin_tab = tk.Frame(step5_nb)
 step5_nb.add(lin_tab, text="Linear Skip")
 
-# Make the whole tab centre-friendly
+# Make the whole tab center-friendly
 lin_tab.columnconfigure(0, weight=1)
 
 # --- centred instruction banner ---------------------------------------------
@@ -1101,7 +1296,7 @@ tk.Label(
 ).grid(row=0, column=0, pady=(0, 15), sticky="n")
 
 # --- form area ---------------------------------------------------------------
-form = tk.Frame(lin_tab)          # inner frame, auto-centred by parent grid
+form = tk.Frame(lin_tab)  # inner frame, auto-centred by parent grid
 form.grid(row=1, column=0)
 
 lin_file_path = tk.StringVar()
@@ -1123,13 +1318,12 @@ tk.Button(
     command=linear_skip_run
 ).grid(row=2, column=1, pady=20)
 
-
 # -------------------------- 5 B : CV-Aware Skip
 cv_tab5 = tk.Frame(step5_nb)
 step5_nb.add(cv_tab5, text="CV-Aware Skip")
 
 cv_file_path = tk.StringVar()
-# --- 5B : CV-Aware Skip  (SIDE HELP PANEL) ------------------------------
+# --- 5B : CV-Aware Skip (SIDE HELP PANEL) ------------------------------
 cv_help = tk.Text(
     cv_tab5, font=("Arial", 12), fg="blue", width=38, height=16, wrap="word",
     bg=root.cget("bg"), relief="flat", borderwidth=0
@@ -1139,7 +1333,7 @@ cv_help.insert(
     "CV-aware skip keeps:\n"
     " • The first and last spectra\n"
     " • Both spectra at each defined vertex (E_begin, E_vertex1, E_vertex2)\n"
-    " • The first and last spectrum within every ΔV interval "
+    " • The spectrum within every ΔV interval "
     "across the cycle (using the ± tolerances)\n\n"
     "Result: a compact data set that still covers all key voltages "
     "and samples uniformly in between."
@@ -1147,7 +1341,6 @@ cv_help.insert(
 cv_help.configure(state="disabled")
 # Place to the right of the parameter grid
 cv_help.grid(row=0, column=3, rowspan=20, sticky="nw", padx=(20, 0), pady=5)
-
 
 tk.Label(cv_tab5, text="CSV File:", font=("Arial", 10, "bold")
          ).grid(row=0, column=0, sticky="e", padx=5, pady=5)
@@ -1206,6 +1399,124 @@ sugg_neg_lbl.grid(row=row, column=2, sticky="w")
 tk.Button(cv_tab5, text="Run CV-Aware Skip", bg="sky blue",
           command=cv_skip_run).grid(row=row + 1, column=1, pady=20)
 
+
+# ----------------- End of CV aware skip -----------------
+# ───────────────────────────────────────────────────  Crop tab UI
+class RangeSlider(tk.Canvas):
+    def __init__(self, parent, length=400, handle_radius=8, **kwargs):
+        super().__init__(parent, width=length, height=2*handle_radius+20, **kwargs)
+        self.length = length
+        self.hr = handle_radius
+        self.low_idx = 0
+        self.high_idx = 1
+        self.min_idx = 0
+        self.max_idx = 1
+
+        # draw track + handles
+        self.track = self.create_line(0, self.hr+10, length, self.hr+10, width=4)
+        self.handle_low  = self.create_oval(0,0,0,0, fill="gray")
+        self.handle_high = self.create_oval(0,0,0,0, fill="gray")
+
+        # mouse events
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>",    self._on_drag)
+        self.active = None
+
+    def configure(self, **kwargs):
+        if 'range' in kwargs:
+            self.min_idx, self.max_idx = kwargs.pop('range')
+        super().configure(**kwargs)
+
+    def set_values(self, i0, i1):
+        # clamp to [min_idx,max_idx]
+        self.low_idx  = max(self.min_idx, min(i0, self.max_idx))
+        self.high_idx = max(self.min_idx, min(i1, self.max_idx))
+        self._draw_handles()
+
+    def get_values(self):
+        return (self.low_idx, self.high_idx)
+
+    def _idx_to_x(self, idx):
+        span = self.max_idx - self.min_idx
+        if span <= 0: return 0
+        return ((idx - self.min_idx) / span) * self.length
+
+    def _x_to_idx(self, x):
+        span = self.max_idx - self.min_idx
+        frac = min(max(x, 0), self.length) / self.length
+        return int(round(self.min_idx + frac*span))
+
+    def _draw_handles(self):
+        for idx, handle in ((self.low_idx, self.handle_low),
+                            (self.high_idx, self.handle_high)):
+            x = self._idx_to_x(idx)
+            self.coords(handle, x-self.hr, 10, x+self.hr, 10+2*self.hr)
+
+    def _on_press(self, ev):
+        # pick the nearer handle
+        lx = self._idx_to_x(self.low_idx)
+        hx = self._idx_to_x(self.high_idx)
+        self.active = 'low' if abs(ev.x-lx) < abs(ev.x-hx) else 'high'
+
+    def _on_drag(self, ev):
+        idx = self._x_to_idx(ev.x)
+        if self.active == 'low':
+            idx = min(idx, self.high_idx)
+            self.low_idx = max(self.min_idx, idx)
+        else:
+            idx = max(idx, self.low_idx)
+            self.high_idx = min(self.max_idx, idx)
+        self._draw_handles()
+
+        # if you want to sync entry widgets:
+        crop_start.set(crop_values[self.low_idx])
+        crop_stop.set(crop_values[self.high_idx])
+
+crop_tab = tk.Frame(step5_nb)
+step5_nb.add(crop_tab, text="Crop Data")
+
+# Row 0: file selector
+tk.Label(crop_tab, text="CSV File:", font=("Arial", 10, "bold"))\
+  .grid(row=0, column=0, sticky="e", padx=5, pady=5)
+tk.Entry(crop_tab, textvariable=crop_file_path, width=40)\
+  .grid(row=0, column=1, padx=5, pady=5)
+tk.Button(crop_tab, text="Browse…", command=crop_browse)\
+  .grid(row=0, column=2, padx=5, pady=5)
+
+# Row 1–2: suggestions
+sug_min_lbl = tk.Label(crop_tab, text="Min: —", fg="gray")
+sug_min_lbl.grid(row=1, column=2, sticky="w")
+sug_max_lbl = tk.Label(crop_tab, text="Max: —", fg="gray")
+sug_max_lbl.grid(row=2, column=2, sticky="w")
+
+# Row 1: start entry
+tk.Label(crop_tab, text="Start:", font=("Arial", 10, "bold"))\
+  .grid(row=1, column=0, sticky="e", padx=5)
+start_ent = tk.Entry(crop_tab, textvariable=crop_start, width=10)
+start_ent.grid(row=1, column=1, sticky="w")
+start_ent.bind("<Return>", on_crop_entry)
+
+# Row 2: stop entry
+tk.Label(crop_tab, text="Stop:", font=("Arial", 10, "bold"))\
+  .grid(row=2, column=0, sticky="e", padx=5)
+stop_ent = tk.Entry(crop_tab, textvariable=crop_stop, width=10)
+stop_ent.grid(row=2, column=1, sticky="w")
+stop_ent.bind("<Return>", on_crop_entry)
+
+# Row 3: range slider
+range_slider = RangeSlider(crop_tab)
+range_slider.grid(row=3, column=0, columnspan=3, pady=10)
+
+# Row 4: run button
+tk.Button(crop_tab, text="Run Crop", bg="sky blue", command=crop_run)\
+  .grid(row=4, column=1, pady=10)
+
+# Help text
+tk.Label(crop_tab,
+    text="Keeps Wavenumber + all spectra columns whose header "
+         "value lies between Start and Stop (snapped to nearest header).",
+    font=("Arial", 12), fg="blue", wraplength=400, justify="left"
+).grid(row=1, column=3, rowspan=3, padx=20)
 # -------------------------------------------------------------- footer / exit
 tk.Button(root, text="Exit Application", command=exit_application,
           bg="tomato").pack(pady=10)
@@ -1213,7 +1524,7 @@ tk.Button(root, text="Exit Application", command=exit_application,
 tk.Label(root,
          text="Made by Pavithra Gunasekaran + ChatGPT "
               "(pavijovi3@gmail.com)",
-         font=("Helvetica", 8)).pack(pady=10)
+         font=("Helvetica", 9)).pack(pady=10)
 
 # -------------------------------------------------------------- main loop
 root.mainloop()
