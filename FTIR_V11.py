@@ -347,6 +347,8 @@ def combine_time_resolved_csv_to_csv():
                  if f.lower().endswith('.csv') and "static" not in f.lower()]
     if not csv_files:
         messagebox.showerror("Error", "No suitable CSV files found.", parent=window)
+        status_label.config(text="Completed", fg="green")
+        time_resolved_csv_button.config(state=tk.NORMAL)
         return
 
     combined_df = None
